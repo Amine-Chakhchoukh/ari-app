@@ -1,0 +1,11 @@
+# secrets
+.env
+credentials.json
+
+# python
+.venv/
+__pycache__/
+*.pyc
+
+# streamlit
+.streamlit/
