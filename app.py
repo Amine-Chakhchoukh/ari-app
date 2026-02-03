@@ -1,4 +1,5 @@
 import os
+import json
 from pathlib import Path
 from datetime import date, datetime, timedelta
 
@@ -10,32 +11,32 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 
-# ----------------------------
-# Load .env (ONLY)
-# ----------------------------
+# ============================================================
+# Config / Env (local .env + Streamlit Cloud env vars)
+# ============================================================
 ROOT = Path(__file__).resolve().parent
-load_dotenv(ROOT / ".env")
+load_dotenv(ROOT / ".env")  # local only; harmless on Streamlit Cloud
 
-SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "").strip()
-TAB_NAME = os.environ.get("GOOGLE_SHEET_TAB", "trips").strip()
-CREDENTIALS_JSON_PATH = os.environ.get("GOOGLE_CREDENTIALS_JSON", str(ROOT / "credentials.json")).strip()
-DEFAULT_APPLICATION_DATE_STR = os.environ.get("DEFAULT_APPLICATION_DATE", "").strip()  # optional
+def env(name: str, default: str = "") -> str:
+    return os.environ.get(name, default).strip()
 
+SHEET_ID = env("GOOGLE_SHEET_ID")
+TAB_NAME = env("GOOGLE_SHEET_TAB", "trips")
+
+# Local default (file exists on your machine)
+CREDENTIALS_JSON_PATH = env("GOOGLE_CREDENTIALS_JSON", str(ROOT / "credentials.json"))
+
+# Streamlit Cloud: put full JSON content here as an env var (NOT a file)
+GCP_SERVICE_ACCOUNT_JSON = env("GCP_SERVICE_ACCOUNT_JSON")
+
+DEFAULT_APPLICATION_DATE_STR = env("DEFAULT_APPLICATION_DATE")  # optional
 
 FORM_AN_GUIDANCE_URL = "https://www.gov.uk/government/publications/form-an-guidance/form-an-guidance-accessible"
 
 
-# ----------------------------
+# ============================================================
 # Date helpers
-# ----------------------------
-def parse_iso_yyyy_mm_dd(s: str) -> date:
-    return datetime.strptime(s.strip(), "%Y-%m-%d").date()
-
-
-def parse_uk_dd_mm_yyyy(s: str) -> date:
-    return datetime.strptime(s.strip(), "%d/%m/%Y").date()
-
-
+# ============================================================
 def safe_parse_date(s) -> date | None:
     if s is None:
         return None
@@ -50,11 +51,15 @@ def safe_parse_date(s) -> date | None:
     return None
 
 
-# ----------------------------
+def uk_fmt(d: date) -> str:
+    return d.strftime("%d/%m/%Y")
+
+
+# ============================================================
 # Home Office counting rule (Form AN guidance)
 # Only whole days abroad count. Do NOT count the day you leave OR the day you return.
 # If leave=1st, return=2nd => 0 days absent
-# ----------------------------
+# ============================================================
 def whole_days_abroad(leave: date, ret: date) -> int:
     if ret <= leave:
         return 0
@@ -122,17 +127,31 @@ def is_in_uk_on_day(trips: pd.DataFrame, d: date) -> bool:
     return True
 
 
-def uk_fmt(d: date) -> str:
-    return d.strftime("%d/%m/%Y")
-
-
-# ----------------------------
+# ============================================================
 # Google Sheets load
-# ----------------------------
+# ============================================================
 @st.cache_data(ttl=60)
 def load_trips_df(sheet_id: str, tab_name: str, credentials_path: str) -> pd.DataFrame:
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    creds = Credentials.from_service_account_file(credentials_path, scopes=scopes)
+
+    # Local: file path exists
+    if Path(credentials_path).exists():
+        creds = Credentials.from_service_account_file(credentials_path, scopes=scopes)
+
+    # Cloud: read the entire JSON from env var
+    elif GCP_SERVICE_ACCOUNT_JSON:
+        info = json.loads(GCP_SERVICE_ACCOUNT_JSON)
+        creds = Credentials.from_service_account_info(info, scopes=scopes)
+
+    else:
+        raise ValueError(
+            "Missing Google credentials.\n\n"
+            "Local dev:\n"
+            "  - Put credentials.json in the repo OR set GOOGLE_CREDENTIALS_JSON to its path.\n\n"
+            "Streamlit Cloud:\n"
+            "  - Set env var GCP_SERVICE_ACCOUNT_JSON to the full service-account JSON."
+        )
+
     gc = gspread.authorize(creds)
 
     ws = gc.open_by_key(sheet_id).worksheet(tab_name)
@@ -177,9 +196,9 @@ def load_trips_df(sheet_id: str, tab_name: str, credentials_path: str) -> pd.Dat
     return df
 
 
-# ----------------------------
+# ============================================================
 # App UI
-# ----------------------------
+# ============================================================
 st.set_page_config(page_title="Ari – UK Citizenship Absence Checker", layout="centered")
 
 st.title("🇬🇧 Ari – UK Citizenship Absence Checker")
@@ -190,13 +209,18 @@ st.markdown(
     f"[Form AN guidance]({FORM_AN_GUIDANCE_URL})."
 )
 
-# Basic safety checks (quiet)
+# Required config checks
 if not SHEET_ID:
-    st.error("Missing GOOGLE_SHEET_ID in .env")
+    st.error("Missing GOOGLE_SHEET_ID (set it in .env locally, or as an environment variable on Streamlit Cloud).")
     st.stop()
 
-if not Path(CREDENTIALS_JSON_PATH).exists():
-    st.error(f"Missing credentials.json at: {CREDENTIALS_JSON_PATH}")
+# Local file OR cloud JSON must exist
+if not Path(CREDENTIALS_JSON_PATH).exists() and not GCP_SERVICE_ACCOUNT_JSON:
+    st.error(
+        "Missing Google credentials.\n\n"
+        "Local: ensure credentials.json exists OR set GOOGLE_CREDENTIALS_JSON.\n"
+        "Cloud: set GCP_SERVICE_ACCOUNT_JSON env var to the full credentials JSON."
+    )
     st.stop()
 
 # Default application date
@@ -215,7 +239,7 @@ except Exception as e:
     st.error(f"Could not load Google Sheet (tab '{TAB_NAME}').\n\n{e}")
     st.stop()
 
-# Windows (simple approximation by days; OK for your use-case)
+# Windows (simple day-based windows)
 window_end = app_date  # inclusive for our day-counting logic
 window_12m_start = app_date - timedelta(days=365)
 window_5y_start = app_date - timedelta(days=5 * 365)
@@ -223,9 +247,7 @@ window_5y_start = app_date - timedelta(days=5 * 365)
 abs_12m = count_absences_in_window(trips_df, window_12m_start, window_end)
 abs_5y = count_absences_in_window(trips_df, window_5y_start, window_end)
 
-# Presence 5 years ago check:
-# Must be physically in the UK exactly 5 years before application date.
-# (We use 5*365 days as a practical approximation; good enough for now.)
+# Presence 5 years ago check (day-based approximation)
 five_years_ago_day = app_date - timedelta(days=5 * 365)
 present_5y_ago = is_in_uk_on_day(trips_df, five_years_ago_day)
 
